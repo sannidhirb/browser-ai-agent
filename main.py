@@ -8,10 +8,11 @@ from agent.core import run_agent
 
 app = FastAPI(title="Browser AI Agent API")
 
-# Allow the future React frontend (running on a different port) to call this API
+# CORS is wide open for local development. Restrict allow_origins to the deployed
+# frontend's actual domain before exposing this publicly.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # fine for local development; we'll tighten this later
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,18 +30,19 @@ def root():
 
 @app.post("/run-task")
 def run_task(request: TaskRequest):
-    """Runs the agent synchronously and returns the full report once done."""
+    """Runs the agent end-to-end and returns the full report once the task completes.
+    This call is synchronous, so the request blocks until the agent loop finishes."""
     report = run_agent(
         task=request.task,
         start_url=request.start_url,
-        headless=True,  # no visible browser window when running as a server
+        headless=True,
     )
     return report
 
 
 @app.get("/reports")
 def list_reports():
-    """Returns a list of all past task runs, most recent first."""
+    """Returns lightweight summaries of every past task run, most recent first."""
     if not os.path.exists("reports"):
         return {"reports": []}
 
@@ -62,7 +64,7 @@ def list_reports():
 
 @app.get("/reports/{run_id}")
 def get_report(run_id: str):
-    """Returns the full report for one specific run."""
+    """Returns the full report for a single run, including every step and screenshot path."""
     report_path = f"reports/{run_id}/report.json"
     if not os.path.exists(report_path):
         return {"error": "Report not found"}

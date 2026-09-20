@@ -102,7 +102,7 @@ function App() {
           <>
             <div className="card">
               <div className="field">
-                <label>Task</label>
+                <label><b>Task</b></label>
                 <input
                   type="text"
                   value={task}
@@ -112,7 +112,7 @@ function App() {
               </div>
 
               <div className="field">
-                <label>Starting URL</label>
+                <label><b>Starting URL</b></label>
                 <input
                   type="text"
                   value={startUrl}

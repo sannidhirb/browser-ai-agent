@@ -11,8 +11,9 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 def get_page_summary(page, max_elements=25):
-    """Reads the page, tags visible interactive elements, and scores them so that
-    sort/filter controls and price-like text are prioritized over navigation noise."""
+    """Builds a compact, LLM-friendly description of the current page: visible text plus
+    a ranked list of interactive elements. Elements are scored so that sort/filter controls
+    and price-like text are prioritized over navigation noise on content-heavy pages."""
     page.evaluate("""
         () => {
             const els = document.querySelectorAll('input, button, a, select, textarea');
@@ -32,9 +33,7 @@ def get_page_summary(page, max_elements=25):
 
     visible_text = page.inner_text("body")[:2500]
 
-    elements = []
     tagged = page.query_selector_all("[data-agent-id]")
-
     scored_elements = []
     sort_keywords = ["low to high", "high to low", "price", "sort"]
 
@@ -50,6 +49,8 @@ def get_page_summary(page, max_elements=25):
                 current_value = ""
         text = el.inner_text()[:60] if tag not in ("input", "textarea") else ""
 
+        # Rank elements by relevance rather than DOM order, so sort controls and
+        # price text survive the max_elements cutoff on pages with heavy nav/footer clutter.
         score = 0
         text_lower = text.lower()
         if any(kw in text_lower for kw in sort_keywords):
@@ -65,18 +66,21 @@ def get_page_summary(page, max_elements=25):
 
     scored_elements.sort(key=lambda x: x[0], reverse=True)
 
-    for score, agent_id, tag, placeholder, current_value, text in scored_elements[:max_elements]:
-        elements.append(
-            f'[id={agent_id}] <{tag}> placeholder="{placeholder}" value="{current_value}" text="{text}"'
-        )
-
+    elements = [
+        f'[id={agent_id}] <{tag}> placeholder="{placeholder}" value="{current_value}" text="{text}"'
+        for score, agent_id, tag, placeholder, current_value, text in scored_elements[:max_elements]
+    ]
     elements_text = "\n".join(elements)
+
     return f"VISIBLE TEXT:\n{visible_text}\n\nINTERACTIVE ELEMENTS (use the [id=N] number as the id):\n{elements_text}"
 
 
 def ask_ai(task, page_summary, history):
+    """Sends the task, page summary, and prior action history to the LLM and returns its
+    next decision as a parsed dict. Elements are referenced by numeric id rather than CSS
+    selector, since the model reliably picks a number from a list but not reliably valid CSS."""
     history_text = "\n".join(
-        [f"{i+1}. {h}" for i, h in enumerate(history)]
+        f"{i + 1}. {h}" for i, h in enumerate(history)
     ) if history else "No actions taken yet."
 
     prompt = f"""You are a browser automation agent controlling a real browser step by step.
@@ -124,21 +128,25 @@ Respond ONLY with valid JSON, no other text:
 Leave unused fields as null.
 """
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[{"role": "user", "content": prompt}]
     )
     return json.loads(response.choices[0].message.content)
 
 
 def run_agent(task, start_url, max_steps=10, headless=False):
-    """Runs the full observe-plan-act loop for a given task and returns a report dict.
-    This is the single function the future FastAPI backend will call."""
+    """Runs the observe-plan-act loop for a single task: read the page, ask the model for
+    the next action, execute it with Playwright, and repeat until the model reports the
+    task is done or max_steps is reached. Returns a report dict and saves it to disk
+    alongside a per-step screenshot trail."""
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_folder = f"reports/{run_id}"
     os.makedirs(run_folder, exist_ok=True)
 
-    report = {"task": task, "start_url": start_url, "timestamp": run_id,
-              "steps": [], "final_answer": None, "status": "incomplete"}
+    report = {
+        "task": task, "start_url": start_url, "timestamp": run_id,
+        "steps": [], "final_answer": None, "status": "incomplete",
+    }
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -156,15 +164,17 @@ def run_agent(task, start_url, max_steps=10, headless=False):
 
             action = decision["action"]
             step_screenshot = f"{run_folder}/step_{step + 1}.png"
-            step_record = {"step": step + 1, "action": action,
-                            "reasoning": decision.get("reasoning"), "screenshot": step_screenshot}
+            step_record = {
+                "step": step + 1, "action": action,
+                "reasoning": decision.get("reasoning"), "screenshot": step_screenshot,
+            }
 
             if action == "done":
                 report["final_answer"] = decision["answer"]
                 report["status"] = "success"
                 page.screenshot(path=step_screenshot)
                 report["steps"].append(step_record)
-                print("\n✅ TASK COMPLETE")
+                print("\nTASK COMPLETE")
                 print("Answer:", decision["answer"])
                 break
 
@@ -189,12 +199,18 @@ def run_agent(task, start_url, max_steps=10, headless=False):
                     history.append(f'clicked element {decision["id"]}')
 
                 elif action == "click_by_text":
+                    # Fallback for controls (e.g. sort links) that aren't standard
+                    # input/button/a tags and so never get a numeric id.
                     page.get_by_text(decision["value"], exact=False).first.click(timeout=5000)
                     history.append(f'clicked element containing text "{decision["value"]}"')
 
             except Exception as e:
-                print(f"⚠️ Action failed: {e}")
-                history.append(f'{action} FAILED ({decision.get("id") or decision.get("value")}) - try something else')
+                # Log the failure into history so the model doesn't retry the same
+                # broken action indefinitely, and keep the loop moving.
+                print(f"Action failed: {e}")
+                history.append(
+                    f'{action} FAILED ({decision.get("id") or decision.get("value")}) - try something else'
+                )
                 step_record["error"] = str(e)
 
             page.screenshot(path=step_screenshot)
@@ -202,7 +218,7 @@ def run_agent(task, start_url, max_steps=10, headless=False):
             page.wait_for_timeout(1500)
         else:
             report["status"] = "max_steps_reached"
-            print("\n⚠️ Max steps reached without finishing.")
+            print("\nMax steps reached without finishing.")
 
         browser.close()
 
@@ -216,8 +232,8 @@ def run_agent(task, start_url, max_steps=10, headless=False):
             f.write(f"### Step {s['step']}: {s['action']}\n- Reasoning: {s.get('reasoning')}\n")
             f.write(f"- Screenshot: {s['screenshot']}\n")
             if "error" in s:
-                f.write(f"- ⚠️ Error: {s['error']}\n")
+                f.write(f"- Error: {s['error']}\n")
             f.write("\n")
 
-    print(f"\n📁 Full report saved to: {run_folder}/report.md")
+    print(f"\nFull report saved to: {run_folder}/report.md")
     return report
