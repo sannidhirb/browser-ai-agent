@@ -1,10 +1,14 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from worker import run_agent_task
+import redis.asyncio as aioredis
+import asyncio
 import os
 import json
 
 from agent.core import run_agent
+from db import SessionLocal, TaskRun
 
 app = FastAPI(title="Browser AI Agent API")
 
@@ -30,43 +34,83 @@ def root():
 
 @app.post("/run-task")
 def run_task(request: TaskRequest):
-    """Runs the agent end-to-end and returns the full report once the task completes.
-    This call is synchronous, so the request blocks until the agent loop finishes."""
-    report = run_agent(
-        task=request.task,
-        start_url=request.start_url,
-        headless=True,
-    )
-    return report
+    """Enqueues the task to run in a background Celery worker and returns
+    immediately with a task_id the client can use to check status/result."""
+    job = run_agent_task.delay(request.task, request.start_url)
+    return {"task_id": job.id}
+
+
+@app.get("/task-status/{task_id}")
+def task_status(task_id: str):
+    """Returns the current status of a background task, and its result once ready."""
+    result = run_agent_task.AsyncResult(task_id)
+    return {
+        "task_id": task_id,
+        "status": result.status,
+        "result": result.result if result.ready() else None,
+    }
 
 
 @app.get("/reports")
 def list_reports():
-    """Returns lightweight summaries of every past task run, most recent first."""
-    if not os.path.exists("reports"):
-        return {"reports": []}
+    session = SessionLocal()
+    runs = session.query(TaskRun).order_by(TaskRun.created_at.desc()).all()
+    session.close()
 
-    run_ids = sorted(os.listdir("reports"), reverse=True)
-    summaries = []
-    for run_id in run_ids:
-        report_path = f"reports/{run_id}/report.json"
-        if os.path.exists(report_path):
-            with open(report_path) as f:
-                data = json.load(f)
-            summaries.append({
-                "run_id": run_id,
-                "task": data.get("task"),
-                "status": data.get("status"),
-                "final_answer": data.get("final_answer"),
-            })
-    return {"reports": summaries}
+    return {
+        "reports": [
+            {
+                "run_id": r.id,
+                "task": r.task,
+                "status": r.status,
+                "final_answer": r.final_answer
+            }
+            for r in runs
+        ]
+    }
 
 
 @app.get("/reports/{run_id}")
 def get_report(run_id: str):
-    """Returns the full report for a single run, including every step and screenshot path."""
-    report_path = f"reports/{run_id}/report.json"
-    if not os.path.exists(report_path):
+    session = SessionLocal()
+    run = session.query(TaskRun).filter(TaskRun.id == run_id).first()
+    session.close()
+
+    if not run:
         return {"error": "Report not found"}
-    with open(report_path) as f:
-        return json.load(f)
+
+    return {
+        "task": run.task,
+        "start_url": run.start_url,
+        "status": run.status,
+        "final_answer": run.final_answer,
+        "steps": run.steps,
+    }
+
+@app.websocket("/ws/{task_id}")
+async def task_updates_ws(websocket: WebSocket, task_id: str):
+    await websocket.accept()
+
+    r = aioredis.Redis(
+        host="localhost",
+        port=6379,
+        db=0
+    )
+
+    pubsub = r.pubsub()
+
+    await pubsub.subscribe(f"task_updates:{task_id}")
+
+    try:
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                await websocket.send_text(
+                    message["data"].decode()
+                )
+    except Exception:
+        pass
+    finally:
+        await pubsub.unsubscribe(
+            f"task_updates:{task_id}"
+        )
+        await websocket.close()

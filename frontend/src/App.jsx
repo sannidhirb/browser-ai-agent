@@ -8,6 +8,7 @@ function App() {
   const [task, setTask] = useState('')
   const [startUrl, setStartUrl] = useState('')
   const [loading, setLoading] = useState(false)
+  const [liveStatus, setLiveStatus] = useState('')
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
 
@@ -19,6 +20,7 @@ function App() {
     setLoading(true)
     setError(null)
     setResult(null)
+    setLiveStatus('')
 
     try {
       const response = await fetch(`${API_URL}/run-task`, {
@@ -34,11 +36,57 @@ function App() {
         throw new Error(`Server responded with status ${response.status}`)
       }
 
-      const data = await response.json()
-      setResult(data)
+      const { task_id } = await response.json()
+
+      const ws = new WebSocket(
+        `ws://127.0.0.1:8000/ws/${task_id}`
+      )
+
+      ws.onmessage = (event) => {
+        const update = JSON.parse(event.data)
+
+        setLiveStatus(
+          `Step ${update.step}: ${update.action} — ${update.reasoning}`
+        )
+      }
+
+      ws.onerror = () => {
+        console.log('WebSocket connection error')
+      }
+
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await fetch(
+            `${API_URL}/task-status/${task_id}`
+          )
+
+          const statusData = await statusRes.json()
+
+          if (
+            statusData.status === 'SUCCESS' ||
+            statusData.status === 'FAILURE'
+          ) {
+            clearInterval(poll)
+            ws.close()
+
+            if (statusData.status === 'SUCCESS') {
+              setResult(statusData.result)
+            } else {
+              setError('The agent task failed.')
+            }
+
+            setLoading(false)
+          }
+        } catch (err) {
+          clearInterval(poll)
+          ws.close()
+          setError('Could not check the task status.')
+          setLoading(false)
+        }
+      }, 2000)
+
     } catch (err) {
       setError('Could not reach the agent server. Is it running?')
-    } finally {
       setLoading(false)
     }
   }
@@ -133,7 +181,7 @@ function App() {
                 <div className="thinking-orb-row">
                   <div className="thinking-orb"></div>
                   <span>
-                    Agent is working — this can take 15-40 seconds...
+                    {liveStatus || 'Agent is starting...'}
                   </span>
                 </div>
               )}
